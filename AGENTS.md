@@ -14,6 +14,100 @@ native modules, downloads Linux Electron, stages bundled resources, writes
 AppImage. Native packages also include `codex-update-manager` and an
 update-builder bundle.
 
+## Remote Web Host Initiative
+
+This fork is also the development base for an opt-in remote Web implementation
+on branch `feature/remote-web-host`. The goal is to expose the existing Codex
+Desktop renderer experience to a browser while retaining the real Linux
+Electron main process and its complete App Host services.
+
+### Confirmed Architecture
+
+- Keep the patched `codex-desktop-linux` Electron main process. Do not recreate
+  the Electron main API with Node.js stubs.
+- Keep the upstream App Host RPC protocol opaque. Current upstream bundles run
+  the RPC connection over a transport with `send`, `receive`, and `abort`; the
+  MessagePort adapters exchange string frames and reject non-string messages.
+- Replace only the outer MessagePort transport with a WebSocket-backed,
+  MessagePort-compatible adapter. Do not parse, translate, or reimplement App
+  Host service calls as `{ service, method, args }` requests.
+- Use the browser and Electron main bundles from the exact same upstream DMG.
+  Include the upstream build identity in the WebSocket handshake and reject a
+  stale browser bundle rather than supporting cross-version RPC.
+- Preserve bidirectional RPC. Renderer-owned services, callbacks, streams,
+  reference counting, release, abort, and `onRpcBroken` must continue to use the
+  upstream RPC implementation unchanged.
+- App Host RPC is not the only Electron communication path. Bridge the small
+  set of ordinary preload/IPC channels needed by the browser separately; do not
+  mix their envelopes into opaque App Host RPC frames.
+
+### Session Model
+
+- Treat each independent browser tab or installed PWA instance as one remote
+  surface session.
+- Give each remote surface a distinct hidden Electron `WebContents` lifecycle
+  owner. The upstream AppView registry is keyed by `webContents.id`; sharing one
+  owner would let later clients overwrite earlier clients and would conflate
+  subscriptions, presented state, downloads, notifications, and cleanup.
+- Create hidden owners through the upstream window/window-context lifecycle
+  where possible. Do not fake arbitrary `WebContents` objects.
+- Frontend state is isolated per surface, including route, composer draft,
+  selection, and sidebar state. Backend state remains shared through the same
+  WindowContext, app-server connection registry, execution hosts, thread
+  catalog, workspace files, local environments, SQLite state, and account.
+- A short WebSocket reconnect must reattach to the existing RPC session,
+  App Host, and hidden owner. Do not create a new RPC connection while the old
+  connection still owns callbacks or remote references. After the resume grace
+  period, abort and dispose the old session before creating a replacement.
+
+### Development Boundaries
+
+- Implement this work as an optional, disabled-by-default feature under
+  `linux-features/remote-web-host/`. Browser-specific code stays in that
+  feature directory.
+- If the feature needs a core touchpoint, add only the smallest generic hook to
+  core and keep WebSocket, authentication, browser shim, and session policy out
+  of core.
+- Reuse proven concepts from the sibling `codex-web` repository selectively:
+  its reliable WebSocket bridge, browser Electron shim, HTTP/authentication
+  server, PWA/mobile patches, and focused IPC tests. Do not import its Electron
+  main-process stub architecture.
+- Prefer one WebSocket connection per App Host RPC connection so RPC string
+  frames can remain unwrapped. Authentication, connection identity, build
+  identity, and resume metadata belong in the upgrade/handshake layer.
+- Do not expose the Web endpoint without authentication. Remote access can run
+  commands and read or modify files with the permissions of the desktop host.
+- Do not add Web-native replacements for browser sidebar, clipboard, file
+  picker, drag-and-drop, notifications, or Computer Use until a concrete
+  required flow demonstrates that the transparent host bridge is insufficient.
+
+### Upstream Version Policy
+
+- Normal repository behavior follows the current DMG at the persistent
+  upstream URL. During initial Web transport development, use an explicit DMG
+  path or `CODEX_DMG_REFRESH_MODE=pinned` so transport regressions are not
+  confused with upstream drift.
+- Keep one known-good pinned-DMG test for local regression detection and one
+  latest-DMG compatibility test for detecting changes to `connect-app-host`,
+  MessagePort frame types, preload IPC channels, or bootstrap structure.
+- Electron should continue to be detected from the DMG. Do not introduce a
+  separate Web-specific Electron version pin.
+
+### Web Acceptance Criteria
+
+- The browser initializes the unmodified upstream App Host RPC client over the
+  WebSocket transport and can invoke at least one callback-bearing service.
+- Two simultaneous browser surfaces have different `webContents.id` owners,
+  share persistent thread/backend data, and do not overwrite each other's
+  AppView registrations or per-surface activity state.
+- A transient network disconnect resumes without losing RPC references or
+  duplicating processed frames; an expired session disposes all owner and RPC
+  resources.
+- A browser bundle from a different upstream build is rejected with a clear
+  reload requirement.
+- Existing native Electron launch behavior remains unchanged when the optional
+  feature is disabled.
+
 ## Maintainer Rules
 
 - This project supports only the latest upstream `CODEX.DMG`. When fixing

@@ -1,0 +1,28 @@
+{
+  "id": "remote-web-host",
+  "title": "Remote Web Host",
+  "description": "Experimental protocol-transparent WebSocket transport for the upstream App Host RPC connection.",
+  "defaultEnabled": false,
+  "entrypoints": {
+    "patchDescriptors": "./patch.js"
+  },
+  "resources": [
+    {
+      "source": "runtime/app-host-server.cjs",
+      "target": ".codex-linux/features/remote-web-host/app-host-server.cjs",
+      "mode": "0644"
+    }
+  ],
+  "runtimeHooks": {
+    "env": {
+      "source": "webview-proxy.env",
+      "name": "remote-web-host.env",
+      "mode": "0644"
+    },
+    "launcher": {
+      "source": "launcher-hook.sh",
+      "name": "remote-web-host.sh",
+      "mode": "0755"
+    }
+  }
+}

@@ -2758,7 +2758,7 @@ start_webview_server() {
     stop_owned_webview_server
 
     cd "$WEBVIEW_DIR"
-    python3 "$SCRIPT_DIR/.codex-linux/webview-server.py" "$CODEX_LINUX_WEBVIEW_PORT" --bind 127.0.0.1 &
+    python3 "$SCRIPT_DIR/.codex-linux/webview-server.py" "$CODEX_LINUX_WEBVIEW_PORT" --bind "${CODEX_LINUX_WEBVIEW_BIND:-127.0.0.1}" &
     STARTED_WEBVIEW_PID=$!
     echo "$STARTED_WEBVIEW_PID" > "$WEBVIEW_PID_FILE"
     WEBVIEW_STARTUP_PENDING=1
