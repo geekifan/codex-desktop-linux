@@ -1,11 +1,18 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const fs = require("node:fs");
 const http = require("node:http");
+const path = require("node:path");
 const { EventEmitter } = require("node:events");
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+const RELIABLE_PROTOCOL_VERSION = 1;
+const DEFAULT_RECONNECT_GRACE_MS = 5 * 60 * 1_000;
+const DEFAULT_MAX_UNACKED_BYTES = 64 * 1024 * 1_024;
+const DEFAULT_MAX_IN_FLIGHT_BYTES = 256 * 1024;
+const KEEPALIVE_INTERVAL_MS = 5_000;
+const SOCKET_TIMEOUT_MS = 20_000;
 
 function websocketAccept(key) {
   return crypto
@@ -136,12 +143,278 @@ class WebSocketPeer extends EventEmitter {
   }
 }
 
-class RpcMessagePort extends EventEmitter {
-  constructor(peer) {
+class ReliableSession extends EventEmitter {
+  constructor(options) {
     super();
+    this.connectionId = options.connectionId;
+    this.serverEpoch = options.serverEpoch;
+    this.buildId = options.buildId;
+    this.graceMs = options.graceMs ?? DEFAULT_RECONNECT_GRACE_MS;
+    this.maxUnackedBytes = options.maxUnackedBytes ?? DEFAULT_MAX_UNACKED_BYTES;
+    this.maxInFlightBytes = options.maxInFlightBytes ?? DEFAULT_MAX_IN_FLIGHT_BYTES;
+    this.peer = null;
+    this.peerListeners = null;
+    this.outgoingMessageId = 0;
+    this.outgoingAckId = 0;
+    this.outgoingSentId = 0;
+    this.outgoingUnackedBytes = 0;
+    this.outgoingUnacked = [];
+    this.incomingMessageId = 0;
+    this.disposed = false;
+    this.graceTimer = null;
+    this.keepaliveTimer = null;
+    this.lastIncomingAt = Date.now();
+  }
+
+  attach(peer) {
+    if (this.disposed || peer.closed === true) {
+      peer.close(1012);
+      return false;
+    }
+    this.clearGraceTimer();
+    this.replacePeer(peer);
+    this.lastIncomingAt = Date.now();
+    const onText = (text) => {
+      if (this.peer !== peer) return;
+      this.lastIncomingAt = Date.now();
+      this.receive(text);
+    };
+    const onClose = () => {
+      if (this.peer !== peer) return;
+      this.detachPeer(peer);
+      this.startGraceTimer();
+    };
+    this.peerListeners = { onText, onClose };
+    peer.on("text", onText);
+    peer.on("close", onClose);
+    const ready = this.write({
+      type: "bridge-ready",
+      protocolVersion: RELIABLE_PROTOCOL_VERSION,
+      connectionId: this.connectionId,
+      serverEpoch: this.serverEpoch,
+      buildId: this.buildId,
+    });
+    if (!ready || this.peer !== peer || peer.closed === true) return false;
+    if (!this.writeAck() || this.peer !== peer || peer.closed === true) return false;
+    this.outgoingSentId = this.outgoingAckId;
+    this.pumpOutgoing();
+    if (this.peer !== peer || peer.closed === true) return false;
+    this.startKeepalive();
+    this.emit("attached");
+    return true;
+  }
+
+  send(message) {
+    if (this.disposed) return false;
+    const serializedMessage = JSON.stringify(message);
+    const byteLength = Buffer.byteLength(serializedMessage);
+    const snapshot = JSON.parse(serializedMessage);
+    const outgoing = { id: ++this.outgoingMessageId, message: snapshot, byteLength };
+    this.outgoingUnacked.push(outgoing);
+    this.outgoingUnackedBytes += byteLength;
+    if (this.outgoingUnackedBytes > this.maxUnackedBytes) {
+      this.reset("reliable bridge buffer exceeded");
+      return false;
+    }
+    this.pumpOutgoing();
+    return true;
+  }
+
+  receive(text) {
+    let frame;
+    try {
+      frame = JSON.parse(text);
+    } catch {
+      this.reset("invalid reliable bridge frame");
+      return;
+    }
+    if (frame == null || typeof frame !== "object" || typeof frame.type !== "string") {
+      this.reset("invalid reliable bridge frame");
+      return;
+    }
+    if (frame.type === "bridge-data") {
+      if (this.acceptAck(frame.ack)) this.acceptMessage(frame);
+      return;
+    }
+    if (frame.type === "bridge-ack") {
+      this.acceptAck(frame.ack);
+      return;
+    }
+    if (frame.type === "bridge-replay-request") {
+      if (frame.ack < this.outgoingAckId) {
+        this.reset("invalid reliable bridge replay acknowledgement");
+        return;
+      }
+      if (this.acceptAck(frame.ack, false)) {
+        this.outgoingSentId = frame.ack;
+        this.pumpOutgoing();
+      }
+      return;
+    }
+    if (frame.type === "bridge-keepalive") {
+      return;
+    }
+    if (frame.type === "bridge-disconnect") {
+      this.dispose("client disconnected");
+      return;
+    }
+    this.reset("unsupported reliable bridge frame");
+  }
+
+  acceptMessage(frame) {
+    if (!Number.isSafeInteger(frame.id) || frame.id <= 0) {
+      this.reset("invalid reliable bridge message id");
+      return;
+    }
+    if (frame.id === this.incomingMessageId + 1) {
+      this.incomingMessageId = frame.id;
+      try {
+        this.emit("message", frame.message);
+      } catch {
+        this.reset("reliable bridge message handler failed");
+        return;
+      }
+      this.writeAck();
+      return;
+    }
+    if (frame.id <= this.incomingMessageId) {
+      this.writeAck();
+      return;
+    }
+    this.write({ type: "bridge-replay-request", ack: this.incomingMessageId });
+  }
+
+  acceptAck(ack, pump = true) {
+    if (!Number.isSafeInteger(ack) || ack < 0 || ack > this.outgoingSentId) {
+      this.reset("invalid reliable bridge acknowledgement");
+      return false;
+    }
+    if (ack <= this.outgoingAckId) return true;
+    this.outgoingAckId = ack;
+    for (const message of this.outgoingUnacked) {
+      if (message.id > ack) break;
+      this.outgoingUnackedBytes -= message.byteLength;
+    }
+    this.outgoingUnacked = this.outgoingUnacked.filter((message) => message.id > ack);
+    if (pump) this.pumpOutgoing();
+    return true;
+  }
+
+  pumpOutgoing() {
+    if (this.peer == null) return;
+    let inFlightBytes = this.outgoingUnacked
+      .filter((message) => message.id <= this.outgoingSentId)
+      .reduce((total, message) => total + message.byteLength, 0);
+    for (const message of this.outgoingUnacked) {
+      if (message.id <= this.outgoingSentId) continue;
+      if (inFlightBytes > 0 && inFlightBytes + message.byteLength > this.maxInFlightBytes) break;
+      const written = this.write({
+        type: "bridge-data",
+        id: message.id,
+        ack: this.incomingMessageId,
+        message: message.message,
+      });
+      if (!written) break;
+      this.outgoingSentId = message.id;
+      inFlightBytes += message.byteLength;
+    }
+  }
+
+  writeAck() {
+    return this.write({ type: "bridge-ack", ack: this.incomingMessageId });
+  }
+
+  write(frame) {
+    if (this.peer == null) return false;
+    const peer = this.peer;
+    try {
+      peer.sendText(JSON.stringify(frame));
+      return true;
+    } catch {
+      peer.close(1011);
+      if (this.peer === peer) {
+        this.detachPeer(peer);
+        this.startGraceTimer();
+      }
+      return false;
+    }
+  }
+
+  reset(reason) {
+    this.write({ type: "bridge-reset", reason });
+    this.dispose(reason);
+  }
+
+  replacePeer(peer) {
+    const previous = this.peer;
+    if (previous == null || previous === peer) {
+      this.peer = peer;
+      return;
+    }
+    this.detachPeer(previous);
+    previous.close(1000);
     this.peer = peer;
-    peer.on("text", (data) => this.emit("message", { data }));
-    peer.on("close", () => this.emit("close"));
+  }
+
+  detachPeer(peer) {
+    if (this.peer !== peer) return;
+    if (this.peerListeners != null) {
+      peer.removeListener("text", this.peerListeners.onText);
+      peer.removeListener("close", this.peerListeners.onClose);
+    }
+    this.peerListeners = null;
+    this.peer = null;
+    this.stopKeepalive();
+  }
+
+  startGraceTimer() {
+    this.clearGraceTimer();
+    this.graceTimer = setTimeout(() => this.dispose("reconnection grace period expired"), this.graceMs);
+    this.graceTimer.unref?.();
+  }
+
+  clearGraceTimer() {
+    if (this.graceTimer != null) clearTimeout(this.graceTimer);
+    this.graceTimer = null;
+  }
+
+  startKeepalive() {
+    this.stopKeepalive();
+    this.keepaliveTimer = setInterval(() => {
+      if (Date.now() - this.lastIncomingAt >= SOCKET_TIMEOUT_MS) {
+        this.peer?.close(1001);
+        return;
+      }
+      this.write({ type: "bridge-keepalive" });
+    }, KEEPALIVE_INTERVAL_MS);
+    this.keepaliveTimer.unref?.();
+  }
+
+  stopKeepalive() {
+    if (this.keepaliveTimer != null) clearInterval(this.keepaliveTimer);
+    this.keepaliveTimer = null;
+  }
+
+  dispose(reason = "disposed") {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.clearGraceTimer();
+    this.stopKeepalive();
+    const peer = this.peer;
+    if (peer != null) this.detachPeer(peer);
+    peer?.close(1000);
+    this.outgoingUnacked = [];
+    this.outgoingUnackedBytes = 0;
+    this.emit("dispose", reason);
+  }
+}
+
+class RpcMessagePort extends EventEmitter {
+  constructor(session) {
+    super();
+    this.session = session;
+    session.on("message", (data) => this.emit("message", { data }));
+    session.on("dispose", () => this.emit("close"));
   }
 
   start() {}
@@ -154,11 +427,11 @@ class RpcMessagePort extends EventEmitter {
     if (typeof data !== "string") {
       throw new TypeError("Remote App Host transport only supports string frames");
     }
-    this.peer.sendText(data);
+    this.session.send(data);
   }
 
   close() {
-    this.peer.close();
+    this.session.dispose("RPC transport closed");
   }
 }
 
@@ -171,26 +444,28 @@ function findWindowContext(electron, getContext) {
   return null;
 }
 
-function authorize(request, bind, token) {
-  if (LOOPBACK_HOSTS.has(bind)) return true;
-  if (!token) return false;
-  const url = new URL(request.url, "http://localhost");
-  const provided = Buffer.from(url.searchParams.get("token") ?? "");
-  const expected = Buffer.from(token);
-  return provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
-}
-
 function reject(socket, status, message) {
   socket.end(
     `HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`,
   );
 }
 
-async function attachAppHost({ electron, getContext, createRpc, peer }) {
+async function createAppHostSession({
+  electron,
+  getContext,
+  createRpc,
+  connectionId,
+  serverEpoch,
+  buildId,
+  sessions,
+  signal,
+}) {
   const context = findWindowContext(electron, getContext);
   if (context == null) {
-    peer.close(1013);
     throw new Error("No initialized Codex window context is available");
+  }
+  if (signal?.aborted) {
+    throw new Error("App Host initialization aborted");
   }
   const owner = new electron.BrowserWindow({
     show: false,
@@ -198,21 +473,31 @@ async function attachAppHost({ electron, getContext, createRpc, peer }) {
     height: 1,
     webPreferences: { backgroundThrottling: false },
   });
-  const port = new RpcMessagePort(peer);
-  const appHost = context.createAppHost(owner.webContents);
-  const remoteAppView = createRpc(port, appHost);
-  const dispose = () => {
-    console.log("[remote-web-host] App Host connection closed");
+  const session = new ReliableSession({ connectionId, serverEpoch, buildId });
+  const onOwnerDestroyed = () => session.dispose("App Host owner destroyed");
+  owner.webContents.once("destroyed", onOwnerDestroyed);
+  session.once("dispose", (reason) => {
+    sessions.delete(connectionId);
+    owner.webContents.removeListener("destroyed", onOwnerDestroyed);
+    console.log(`[remote-web-host] App Host session disposed: ${reason}`);
     if (!owner.isDestroyed()) owner.destroy();
-  };
-  peer.once("close", dispose);
+  });
   try {
-    await context.registerAppView(owner.webContents, remoteAppView);
-    console.log("[remote-web-host] App Host connection registered");
+    const port = new RpcMessagePort(session);
+    const appHost = context.createAppHost(owner.webContents);
+    const remoteAppView = createRpc(port, appHost);
+    const registration = context.registerAppView(owner.webContents, remoteAppView);
+    sessions.set(connectionId, session);
+    Promise.resolve(registration).then(() => {
+      if (session.disposed || owner.isDestroyed()) return;
+      console.log(`[remote-web-host] App Host session registered: ${connectionId}`);
+    }).catch((error) => {
+      console.error("[remote-web-host] App Host registration failed", error);
+      session.dispose("App Host registration failed");
+    });
+    return session;
   } catch (error) {
-    peer.removeListener("close", dispose);
-    dispose();
-    peer.close(1011);
+    session.dispose("App Host registration failed");
     throw error;
   }
 }
@@ -222,7 +507,8 @@ const transferablePorts = new Map();
 let ipcRelayListenersInstalled = false;
 
 function sendJson(peer, value) {
-  peer.sendText(JSON.stringify(value));
+  if (typeof peer.send === "function") peer.send(value);
+  else peer.sendText(JSON.stringify(value));
 }
 
 function installIpcRelayListeners(electron) {
@@ -257,6 +543,9 @@ function installIpcRelayListeners(electron) {
     transferablePorts.set(registration.portId, {
       port,
       relayId: registration.relayId,
+      session: null,
+      sessions: new Map(),
+      pendingSessions: new Map(),
       timeout,
       token: registration.token,
     });
@@ -274,89 +563,227 @@ function transferablePortEntry(url) {
   return { entry, portId };
 }
 
-function attachTransferredPort({ entry, portId, peer }) {
-  transferablePorts.delete(portId);
+function createTransferredPortSession({ entry, portId, connectionId, serverEpoch, buildId }) {
+  if (entry.session != null && !entry.session.disposed) {
+    throw new Error("Transferred MessagePort is already claimed");
+  }
   clearTimeout(entry.timeout);
-  const dispose = () => entry.port.close();
-  peer.once("close", dispose);
-  peer.on("text", (text) => {
-    let message;
-    try {
-      message = JSON.parse(text);
-    } catch {
-      peer.close(1003);
-      return;
+  const session = new ReliableSession({ connectionId, serverEpoch, buildId });
+  entry.session = session;
+  entry.sessions.set(connectionId, session);
+  session.once("dispose", () => {
+    entry.sessions.delete(connectionId);
+    if (entry.session === session) {
+      entry.session = null;
+      if (transferablePorts.get(portId) === entry) transferablePorts.delete(portId);
+      entry.port.close();
     }
+  });
+  session.on("message", (message) => {
     if (message?.type !== "message") {
-      peer.close(1003);
+      session.reset("invalid transferred MessagePort frame");
       return;
     }
     entry.port.postMessage(message.data);
   });
   entry.port.on("message", (event) => {
     if (event.ports?.length > 0) {
-      peer.close(1003);
+      session.reset("nested transferred MessagePorts are not supported");
       return;
     }
-    sendJson(peer, { type: "message", data: event.data });
+    sendJson(session, { type: "message", data: event.data });
   });
-  entry.port.on("close", () => peer.close());
+  entry.port.once("close", () => session.reset("Electron MessagePort closed"));
   entry.port.start();
+  return session;
 }
 
-function attachIpcRelay({ electron, getContext, peer }) {
+function createIpcRelaySession({ electron, getContext, connectionId, serverEpoch, buildId, sessions }) {
   installIpcRelayListeners(electron);
   const context = findWindowContext(electron, getContext);
   const owner = electron.BrowserWindow.getAllWindows().find(
     (window) => !window.isDestroyed() && getContext(window.webContents) === context,
   );
   if (owner == null) {
-    peer.close(1013);
-    return;
+    throw new Error("No initialized Codex window is available for IPC relay");
   }
-  const relayId = crypto.randomUUID();
-  ipcRelays.set(relayId, peer);
-  const dispose = () => {
+  const relayId = connectionId;
+  const session = new ReliableSession({ connectionId, serverEpoch, buildId });
+  ipcRelays.set(relayId, session);
+  sessions.set(connectionId, session);
+  session.once("dispose", () => {
     ipcRelays.delete(relayId);
-  };
-  peer.once("close", dispose);
-  peer.on("text", (data) => {
-    let command;
-    try {
-      command = JSON.parse(data);
-    } catch {
-      peer.close(1003);
-      return;
+    sessions.delete(connectionId);
+    for (const [portId, entry] of transferablePorts) {
+      if (entry.relayId !== relayId) continue;
+      if (entry.session != null) entry.session.dispose("owning IPC relay disposed");
+      else {
+        clearTimeout(entry.timeout);
+        transferablePorts.delete(portId);
+        entry.port.close();
+      }
     }
+    if (!owner.isDestroyed()) {
+      owner.webContents.send("codex-linux:remote-ipc-command", { relayId, type: "dispose-relay" });
+    }
+  });
+  session.on("message", (command) => {
     if (
       command == null ||
       typeof command !== "object" ||
       typeof command.requestId !== "string" ||
       !["send-sync", "invoke", "send", "subscribe", "unsubscribe"].includes(command.type)
     ) {
-      peer.close(1003);
+      session.reset("invalid remote IPC command");
       return;
     }
     owner.webContents.send("codex-linux:remote-ipc-command", { relayId, ...command });
   });
-  sendJson(peer, { type: "ready" });
+  sendJson(session, { type: "ready" });
+  return session;
+}
+
+function parseReliableHello(text) {
+  let hello;
+  try {
+    hello = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (
+    hello == null ||
+    hello.type !== "bridge-hello" ||
+    hello.protocolVersion !== RELIABLE_PROTOCOL_VERSION ||
+    typeof hello.connectionId !== "string" ||
+    hello.connectionId.length < 8 ||
+    hello.connectionId.length > 128 ||
+    !(hello.serverEpoch === null || typeof hello.serverEpoch === "string") ||
+    !(hello.buildId === null || typeof hello.buildId === "string")
+  ) {
+    return null;
+  }
+  return hello;
+}
+
+function resetPeer(peer, reason) {
+  try {
+    peer.sendText(JSON.stringify({ type: "bridge-reset", reason }));
+  } finally {
+    peer.close(1008);
+  }
+}
+
+async function acceptReliablePeer({
+  peer,
+  sessions,
+  pendingSessions,
+  serverEpoch,
+  buildId,
+  allowUnknownBuild,
+  createSession,
+}) {
+  const hello = await new Promise((resolve) => {
+    const timeout = setTimeout(() => finish(null), 10_000);
+    timeout.unref?.();
+    const finish = (value) => {
+      clearTimeout(timeout);
+      peer.removeListener("text", onText);
+      peer.removeListener("close", onClose);
+      resolve(value);
+    };
+    const onText = (text) => finish(parseReliableHello(text));
+    const onClose = () => finish(null);
+    peer.once("text", onText);
+    peer.once("close", onClose);
+  });
+  if (hello == null || peer.closed) {
+    if (!peer.closed) resetPeer(peer, "invalid reliable bridge handshake");
+    return;
+  }
+  if (hello.serverEpoch !== null && hello.serverEpoch !== serverEpoch) {
+    resetPeer(peer, "backend restarted");
+    return;
+  }
+  if ((!allowUnknownBuild || hello.buildId !== null) && hello.buildId !== buildId) {
+    resetPeer(peer, "browser bundle version mismatch");
+    return;
+  }
+  let session = sessions.get(hello.connectionId);
+  if (session == null) {
+    if (hello.serverEpoch !== null) {
+      resetPeer(peer, "reconnection session expired");
+      return;
+    }
+    let pending;
+    try {
+      pending = pendingSessions.get(hello.connectionId);
+      if (pending == null) {
+        const controller = new AbortController();
+        pending = {
+          controller,
+          waiters: new Set(),
+          promise: Promise.resolve().then(() => createSession(hello.connectionId, controller.signal)),
+        };
+        pendingSessions.set(hello.connectionId, pending);
+      }
+      pending.waiters.add(peer);
+      const onPendingPeerClose = () => {
+        pending.waiters.delete(peer);
+        if (pending.waiters.size === 0) {
+          if (pendingSessions.get(hello.connectionId) === pending) {
+            pendingSessions.delete(hello.connectionId);
+          }
+          pending.controller.abort();
+        }
+      };
+      peer.once("close", onPendingPeerClose);
+      try {
+        session = await pending.promise;
+      } finally {
+        peer.removeListener("close", onPendingPeerClose);
+        pending.waiters.delete(peer);
+      }
+      if (pendingSessions.get(hello.connectionId) === pending) {
+        pendingSessions.delete(hello.connectionId);
+      }
+    } catch (error) {
+      if (pendingSessions.get(hello.connectionId) === pending) {
+        pendingSessions.delete(hello.connectionId);
+      }
+      console.error("[remote-web-host] failed to create reliable session", error);
+      if (!peer.closed) resetPeer(peer, "failed to create remote session");
+      return;
+    }
+  }
+  if (peer.closed) {
+    if (session.peer == null) session.startGraceTimer();
+    return;
+  }
+  session.attach(peer);
 }
 
 async function start({ electron, getContext, createRpc }) {
-  const bind = process.env.CODEX_REMOTE_WEB_HOST_BIND || "127.0.0.1";
-  const port = Number.parseInt(process.env.CODEX_REMOTE_WEB_HOST_PORT || "5177", 10);
-  const token = process.env.CODEX_REMOTE_WEB_HOST_TOKEN || "";
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error("CODEX_REMOTE_WEB_HOST_PORT must be a valid TCP port");
-  }
-  if (!LOOPBACK_HOSTS.has(bind) && !token) {
-    throw new Error("CODEX_REMOTE_WEB_HOST_TOKEN is required for a non-loopback bind address");
-  }
+  const bind = "127.0.0.1";
+  const port = 5177;
+  const serverEpoch = crypto.randomUUID();
+  const buildId = fs
+    .readFileSync(path.join(electron.app.getAppPath(), ".codex-linux-remote-build-id"), "utf8")
+    .trim();
+  const appHostSessions = new Map();
+  const pendingAppHostSessions = new Map();
+  const ipcSessions = new Map();
+  const pendingIpcSessions = new Map();
 
   const server = http.createServer((request, response) => {
     if (request.url === "/health") {
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, appVersion: electron.app.getVersion() }));
+      response.end(JSON.stringify({
+        ok: true,
+        appVersion: electron.app.getVersion(),
+        protocolVersion: RELIABLE_PROTOCOL_VERSION,
+        buildId,
+        serverEpoch,
+      }));
       return;
     }
     response.writeHead(404);
@@ -365,13 +792,10 @@ async function start({ electron, getContext, createRpc }) {
   server.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url, "http://localhost");
     const key = request.headers["sec-websocket-key"];
+    const transferredPortPath = url.pathname.startsWith("/message-port/");
     const transferredPort = transferablePortEntry(url);
-    if (url.pathname !== "/app-host" && url.pathname !== "/electron-ipc" && transferredPort == null) {
+    if (url.pathname !== "/app-host" && url.pathname !== "/electron-ipc" && !transferredPortPath) {
       reject(socket, "404 Not Found", "Not found");
-      return;
-    }
-    if (!authorize(request, bind, token)) {
-      reject(socket, "401 Unauthorized", "Unauthorized");
       return;
     }
     if (request.headers.upgrade?.toLowerCase() !== "websocket" || typeof key !== "string") {
@@ -385,16 +809,58 @@ async function start({ electron, getContext, createRpc }) {
         `Sec-WebSocket-Accept: ${websocketAccept(key)}\r\n\r\n`,
     );
     const peer = new WebSocketPeer(socket, head);
+    if (transferredPortPath && transferredPort == null) {
+      peer.sendText(JSON.stringify({ type: "bridge-reset", reason: "transferred MessagePort unavailable" }));
+      peer.close(1008);
+      return;
+    }
     if (transferredPort != null) {
-      attachTransferredPort({ ...transferredPort, peer });
+      const { entry, portId } = transferredPort;
+      acceptReliablePeer({
+        peer,
+        sessions: entry.sessions,
+        pendingSessions: entry.pendingSessions,
+        serverEpoch,
+        buildId,
+        allowUnknownBuild: false,
+        createSession: (connectionId) =>
+          createTransferredPortSession({ entry, portId, connectionId, serverEpoch, buildId }),
+      });
       return;
     }
     if (url.pathname === "/electron-ipc") {
-      attachIpcRelay({ electron, getContext, peer });
+      acceptReliablePeer({
+        peer,
+        sessions: ipcSessions,
+        pendingSessions: pendingIpcSessions,
+        serverEpoch,
+        buildId,
+        allowUnknownBuild: false,
+        createSession: (connectionId) =>
+          createIpcRelaySession({ electron, getContext, connectionId, serverEpoch, buildId, sessions: ipcSessions }),
+      });
       return;
     }
-    attachAppHost({ electron, getContext, createRpc, peer }).catch((error) => {
-      console.error("[remote-web-host] App Host connection failed", error);
+    acceptReliablePeer({
+      peer,
+      sessions: appHostSessions,
+      pendingSessions: pendingAppHostSessions,
+      serverEpoch,
+      buildId,
+      allowUnknownBuild: false,
+      createSession: (connectionId, signal) =>
+        createAppHostSession({
+          electron,
+          getContext,
+          createRpc,
+          connectionId,
+          serverEpoch,
+          buildId,
+          sessions: appHostSessions,
+          signal,
+        }),
+    }).catch((error) => {
+      console.error("[remote-web-host] App Host reliable connection failed", error);
     });
   });
   await new Promise((resolve, reject) => {
@@ -407,9 +873,14 @@ async function start({ electron, getContext, createRpc }) {
 
 module.exports = {
   MAX_FRAME_BYTES,
+  RELIABLE_PROTOCOL_VERSION,
+  ReliableSession,
   RpcMessagePort,
   WebSocketPeer,
-  attachTransferredPort,
+  acceptReliablePeer,
+  createTransferredPortSession,
+  createAppHostSession,
+  createIpcRelaySession,
   encodeFrame,
   start,
   websocketAccept,

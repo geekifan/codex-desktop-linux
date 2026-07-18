@@ -11,7 +11,7 @@ The current version implements the App Host transport and ordinary preload IPC:
 - the renderer keeps the upstream RPC client and renderer-owned services;
 - a browser automatically selects a WebSocket-backed MessagePort-compatible
   adapter, while `codexRemoteAppHost` can override its endpoint;
-- Electron main creates one hidden `BrowserWindow` owner per WebSocket and
+- Electron main creates one hidden `BrowserWindow` owner per browser session and
   passes the opaque string frames to the original App Host RPC constructor;
 - the native Electron MessageChannel path is unchanged when `electronBridge`
   is available and the query parameter is absent;
@@ -27,11 +27,14 @@ The current version implements the App Host transport and ordinary preload IPC:
 - `invoke`, `send`, subscriptions, and events are relayed generically without
   dispatching on Codex IPC channel names.
 
-Transferred `MessagePort` values outside the dedicated App Host transport use
-one-time capabilities. The browser receives a real local `MessagePort`; its
-peer is bridged over one same-origin WebSocket to the Electron
-`MessagePortMain`. Nested port transfer from inside an already transferred port
-is rejected explicitly rather than silently losing ownership semantics.
+All three WebSocket transports use a reliable session envelope with sequence
+numbers, acknowledgements, bounded replay, keepalive, and a five-minute
+reconnection grace period. App Host reconnects retain the original RPC graph
+and hidden owner; ordinary IPC reconnects retain relay subscriptions; and a
+transferred `MessagePort` retains its real Electron `MessagePortMain`. Nested
+port transfer is rejected explicitly rather than silently losing ownership.
+Closing either end permanently resets that port transport and stops reconnects
+without reloading the surrounding browser surface.
 
 ## Enable
 
@@ -83,11 +86,10 @@ xvfb-run -a make run-app
 ```
 
 Without a display, Electron exits during Ozone initialization and the launcher
-usually reports status 139. Verify both local endpoints after startup:
+usually reports status 139. Verify the public same-origin endpoint after startup:
 
 ```bash
-curl http://127.0.0.1:5175/index.html
-curl http://127.0.0.1:5177/health
+curl http://127.0.0.1:5175/health
 ```
 
 The launcher also rejects a Codex CLI whose executable or ancestor directories
@@ -113,24 +115,26 @@ reverse proxy on untrusted networks.
 
 ## Configuration
 
-The feature launcher hook enables `CODEX_REMOTE_WEB_HOST=1`. The server uses
-these defaults unless they are already supplied in the launch environment:
+The feature launcher hook enables `CODEX_REMOTE_WEB_HOST=1`. The internal
+Electron bridge is deliberately fixed to `127.0.0.1:5177`; it cannot be bound
+to a network interface or accessed as the public Web endpoint.
 
-- `CODEX_REMOTE_WEB_HOST_BIND=127.0.0.1`
-- `CODEX_REMOTE_WEB_HOST_PORT=5177`
-- `CODEX_REMOTE_WEB_HOST_TOKEN` is unset for loopback-only development
-
-Binding to any non-loopback address without `CODEX_REMOTE_WEB_HOST_TOKEN`
-causes the endpoint to refuse startup. Browser WebSocket clients pass the token
-as `?token=...` on the `/app-host` URL. Prefer a reverse proxy or SSH tunnel;
-the initial server does not implement TLS.
+`CODEX_LINUX_WEBVIEW_BIND` controls the public `5175` listener and
+`CODEX_REMOTE_WEB_HOST_TOKEN` protects it with an HttpOnly cookie. Transferred
+port capability URLs keep their separate `?token=...`. Prefer a reverse proxy
+or SSH tunnel; the initial server does not implement TLS.
 
 ## Protocol Invariants
 
-The bridge deliberately does not understand App Host messages. It preserves
-one text WebSocket message per upstream RPC string frame. Binary frames,
+The bridge deliberately does not understand App Host messages. Reliable
+`bridge-data` envelopes carry each upstream RPC string unchanged. Binary frames,
 fragmented frames, unmasked client frames, and frames larger than 8 MiB are
 rejected.
+
+The browser and Electron main process must present the same SHA-256 build
+identity. It is calculated after all webview patches from the final package,
+main bundle, HTML, renderer assets, and generated browser preload. A stale
+browser bundle is reset and reloaded instead of attempting cross-build replay.
 
 An upstream update needs attention if any of these invariants changes:
 
@@ -148,7 +152,7 @@ node --test linux-features/remote-web-host/test.js
 For a generated app, also verify:
 
 ```bash
-curl http://127.0.0.1:5177/health
+curl http://127.0.0.1:5175/health
 ```
 
 Then connect two browser surfaces and confirm they receive different hidden
@@ -156,11 +160,8 @@ Then connect two browser surfaces and confirm they receive different hidden
 
 ## Known Gaps
 
-- Ordinary preload/Electron IPC is not bridged yet.
-- Reconnect currently creates a new RPC session; reliable resume must retain the
-  existing App Host, hidden owner, and RPC reference state.
-- Browser/main build identity negotiation is not implemented yet.
-- The packaged webview server remains loopback-only and has no Web authentication
-  layer in this feature.
 - Hidden owner windows are created directly because no generic remote-surface
   WindowManager hook exists yet.
+- The Electron browser sidebar renders a native `WebContentsView` and is not a
+  remotely displayable surface.
+- Nested transfer from inside an already transferred `MessagePort` is rejected.

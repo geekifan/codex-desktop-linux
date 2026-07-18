@@ -32,9 +32,9 @@ forwarded without decoding or service-specific routing.
 - `ipcRenderer.invoke(channel, ...args)` request/response, including errors.
 - `ipcRenderer.on`, `once`, `removeListener`, and `removeAllListeners` events.
 - `ipcRenderer.send` when a future preload starts using fire-and-forget IPC.
-- `ipcRenderer.sendSync` through a same-origin synchronous HTTP endpoint backed
-  by a hidden Electron relay renderer; WebSocket alone cannot preserve its
-  synchronous return contract.
+- Startup `ipcRenderer.sendSync` through build-time discovery and an asynchronous
+  preload snapshot populated before the upstream bridge is exposed. Runtime
+  sendSync calls outside that snapshot remain unsupported.
 - `ipcRenderer.postMessage` with transferred `MessagePort` for App Host and MCP
   sandbox channels; ports need dedicated opaque stream identifiers because
   structured clone cannot cross a network socket directly.
@@ -104,10 +104,9 @@ All browser-visible routes share one origin:
 
 ```text
 GET  /*                         static renderer and SPA fallback
-WS   /app-host                 opaque App Host MessagePort transport
-WS   /electron-ipc             asynchronous IPC and event transport
-POST /electron-ipc/sync        synchronous IPC compatibility
-POST /upload                   explicit browser file upload
+WS   /app-host                 reliable opaque App Host transport
+WS   /electron-ipc             reliable asynchronous IPC/event transport
+WS   /message-port/:id         reliable transferred MessagePort transport
 GET  /health                   readiness and protocol versions
 ```
 
@@ -116,6 +115,12 @@ Origin checks, session cookies, CSRF protection for HTTP endpoints, WebSocket
 origin validation, message-size limits, and per-session resource limits are
 required before remote deployment.
 
+The Electron bridge always listens on `127.0.0.1:5177`. The authenticated
+public server proxies the routes above from port `5175`; the internal bridge
+cannot be configured to bind directly to a network interface. `/health`
+returns `protocolVersion`, `buildId`, and `serverEpoch` for compatibility
+diagnostics.
+
 ## Implementation Status
 
 - Implemented: same-origin static assets, `/app-host`, and `/electron-ipc`.
@@ -123,6 +128,10 @@ required before remote deployment.
 - Implemented: startup `sendSync` snapshot on the real primary `webContents`.
 - Implemented: generic `invoke`, `send`, subscribe, unsubscribe, and events.
 - Implemented: one-time transferable-port capabilities backed by a real local
-  browser `MessageChannel` and one same-origin WebSocket per remote port.
+  browser `MessageChannel` and one reliable same-origin session per remote port.
+- Implemented: explicit browser-port close wrapping and permanent reset when
+  either endpoint or a transferred-port capability is no longer available.
 - Implemented: token-gated non-loopback bind and same-origin WebSocket checks.
+- Implemented: sequence/ACK replay, keepalive, five-minute grace, build identity
+  rejection, and bounded send buffers for all three WebSocket transports.
 - Pending: nested port transfer within an already transferred port.

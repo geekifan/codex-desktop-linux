@@ -3,6 +3,7 @@ import ctypes
 import ctypes.util
 import functools
 import hmac
+import http.client
 import http.server
 import os
 import posixpath
@@ -16,6 +17,7 @@ import urllib.parse
 USER_STYLESHEET_ENDPOINT = "/__codex_user_stylesheet.css"
 MAX_USER_STYLESHEET_BYTES = 256 * 1024
 WEBSOCKET_PROXY = os.environ.get("CODEX_LINUX_WEBVIEW_WEBSOCKET_PROXY", "").strip()
+HTTP_PROXY = os.environ.get("CODEX_LINUX_WEBVIEW_HTTP_PROXY", "").strip()
 REMOTE_WEB_TOKEN = os.environ.get("CODEX_REMOTE_WEB_HOST_TOKEN", "")
 
 
@@ -38,6 +40,7 @@ def _parse_websocket_proxy(value):
 
 
 WEBSOCKET_PROXY_CONFIG = _parse_websocket_proxy(WEBSOCKET_PROXY)
+HTTP_PROXY_CONFIG = _parse_websocket_proxy(HTTP_PROXY)
 
 
 def _install_parent_death_signal():
@@ -161,6 +164,8 @@ class CodexWebviewHandler(http.server.SimpleHTTPRequestHandler):
             return
         if self.proxy_websocket():
             return
+        if self.proxy_http():
+            return
         if self.normalized_request_path() == USER_STYLESHEET_ENDPOINT:
             self.serve_user_stylesheet()
             return
@@ -207,6 +212,31 @@ class CodexWebviewHandler(http.server.SimpleHTTPRequestHandler):
                         return True
                     destination = upstream if source is self.connection else self.connection
                     destination.sendall(payload)
+        finally:
+            upstream.close()
+
+    def proxy_http(self):
+        target = HTTP_PROXY_CONFIG.get(self.normalized_request_path())
+        if target is None or self.headers.get("Upgrade", "").lower() == "websocket":
+            return False
+        target_host, target_port = target
+        upstream = http.client.HTTPConnection(target_host, target_port, timeout=10)
+        try:
+            upstream.request("GET", self.path)
+            response = upstream.getresponse()
+            payload = response.read(1024 * 1024 + 1)
+            if len(payload) > 1024 * 1024:
+                self.send_error(502, "Upstream response is too large")
+                return True
+            self.send_response(response.status)
+            self.send_header("Content-Type", response.getheader("Content-Type", "application/octet-stream"))
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return True
+        except (OSError, http.client.HTTPException):
+            self.send_error(502, "HTTP proxy upstream is unavailable")
+            return True
         finally:
             upstream.close()
 
