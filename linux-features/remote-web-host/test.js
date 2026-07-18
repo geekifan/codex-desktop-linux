@@ -348,7 +348,7 @@ test("same-origin WebSocket proxy clears the connect timeout", () => {
 test("main patch adds one transparent server bootstrap", () => {
   const source = [
     "function u6(e,t,n){return new rpc.Connection(new d6(e),t,n).getRemoteMain()}",
-    "function setup(){electron.ipcMain.on(channel,event=>{if(!trusted(event))return;let[port]=event.ports,context=getContext(event.sender),host=context?.createAppHost(event.sender),remote=u6(port,host);context?.registerAppView(event.sender,remote).catch(()=>console.warn(`Failed to register AppView RPC services`))})}",
+    "function setup(){electron.ipcMain.on(channels.connect,event=>{if(!trusted(event))return;let[port]=event.ports,context=getContext(event.sender),host=context?.createAppHost(event.sender),remote=u6(port,host);context?.registerAppView(event.sender,remote).catch(()=>console.warn(`Failed to register AppView RPC services`))})}",
   ].join("");
   const patched = applyMainBundlePatch(source);
   assert.match(patched, /function codexLinuxRemoteWebHostStart/u);

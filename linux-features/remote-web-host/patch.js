@@ -18,7 +18,7 @@ function findMainAnchors(source) {
   }
 
   const registrationMatch = source.match(
-    /([A-Za-z_$][\w$]*)\.ipcMain\.on\(\s*[A-Za-z_$][\w$]*\s*,\s*([A-Za-z_$][\w$]*)\s*=>\s*\{\s*if\s*\(\s*![A-Za-z_$][\w$]*\s*\(\s*\2\s*\)\s*\)\s*return\s*;\s*let\s*\[\s*[A-Za-z_$][\w$]*\s*\]\s*=\s*\2\.ports\s*,\s*[A-Za-z_$][\w$]*\s*=\s*([A-Za-z_$][\w$]*)\s*\(\s*\2\.sender\s*\)\s*,\s*[A-Za-z_$][\w$]*\s*=\s*[A-Za-z_$][\w$]*\?\.createAppHost\(\s*\2\.sender\s*\)/u,
+    /([A-Za-z_$][\w$]*)\.ipcMain\.on\(\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*,\s*([A-Za-z_$][\w$]*)\s*=>\s*\{\s*if\s*\(\s*![A-Za-z_$][\w$]*\s*\(\s*\2\s*\)\s*\)\s*return\s*;\s*let\s*\[\s*[A-Za-z_$][\w$]*\s*\]\s*=\s*\2\.ports\s*,\s*[A-Za-z_$][\w$]*\s*=\s*([A-Za-z_$][\w$]*)\s*\(\s*\2\.sender\s*\)\s*,\s*[A-Za-z_$][\w$]*\s*=\s*[A-Za-z_$][\w$]*\?\.createAppHost\(\s*\2\.sender\s*\)/u,
   );
   if (registrationMatch == null) {
     return null;
