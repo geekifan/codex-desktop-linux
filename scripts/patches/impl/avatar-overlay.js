@@ -77,11 +77,11 @@ function replaceAvatarMethodText(source, method, replacement) {
 }
 
 function avatarCursorRegionPatch(electronVar) {
-  return `codexLinuxIsCursorInAvatarInteractiveRegion(e){let t=this.layout;if(t==null)return!1;let __codexCursor=${electronVar}.screen.getCursorScreenPoint(),__codexBounds=e.getContentBounds(),__codexX=__codexCursor.x-__codexBounds.x,__codexY=__codexCursor.y-__codexBounds.y,__codexWindowHit=__codexX>=0&&__codexY>=0&&__codexX<=__codexBounds.width&&__codexY<=__codexBounds.height;if(!__codexWindowHit)return!1;let __codexHit=e=>e!=null&&__codexX>=e.left&&__codexX<=e.left+e.width&&__codexY>=e.top&&__codexY<=e.top+e.height;return __codexHit(t.mascot)||__codexHit(t.tray)}`;
+  return `codexLinuxIsCursorInAvatarInteractiveRegion(e){let t=this.layout;if(t==null)return!1;let __codexCursor=${electronVar}.screen.getCursorScreenPoint(),__codexBounds=e.getContentBounds(),__codexX=__codexCursor.x-__codexBounds.x,__codexY=__codexCursor.y-__codexBounds.y,__codexWindowHit=__codexX>=0&&__codexY>=0&&__codexX<=__codexBounds.width&&__codexY<=__codexBounds.height;if(!__codexWindowHit)return!1;if(this.codexLinuxShouldUseWholeWindowInput())return!0;let __codexHit=e=>e!=null&&__codexX>=e.left&&__codexX<=e.left+e.width&&__codexY>=e.top&&__codexY<=e.top+e.height;return __codexHit(t.mascot)||__codexHit(t.tray)}`;
 }
 
 function avatarInputShapePatch() {
-  return "codexLinuxBuildAvatarInputShape(e){let t=this.layout;if(t==null)return null;let r;try{r=e.getContentBounds()}catch{return null}if(r==null||!Number.isFinite(r.width)||!Number.isFinite(r.height))return null;if(this.dragState!=null)return[{x:0,y:0,width:r.width,height:r.height}];let i=e=>{if(e==null)return null;let t=Math.max(0,e.left),n=Math.max(0,e.top),i=Math.min(r.width,e.left+e.width)-t,a=Math.min(r.height,e.top+e.height)-n;return i<=0||a<=0?null:{x:t,y:n,width:i,height:a}};return[i(t.mascot),i(t.tray)].filter(Boolean)}";
+  return "codexLinuxShouldUseWholeWindowInput(){return this.codexLinuxWholeWindowInput===!0}codexLinuxBuildAvatarInputShape(e){let t=this.layout;if(t==null)return null;let r;try{r=e.getContentBounds()}catch{return null}if(r==null||!Number.isFinite(r.width)||!Number.isFinite(r.height))return null;if(this.dragState!=null||this.codexLinuxShouldUseWholeWindowInput())return[{x:0,y:0,width:r.width,height:r.height}];let i=e=>{if(e==null)return null;let t=Math.max(0,e.left),n=Math.max(0,e.top),i=Math.min(r.width,e.left+e.width)-t,a=Math.min(r.height,e.top+e.height)-n;return i<=0||a<=0?null:{x:t,y:n,width:i,height:a}};return[i(t.mascot),i(t.tray)].filter(Boolean)}";
 }
 
 function avatarApplyInputShapePatch() {
@@ -98,6 +98,40 @@ function patchAvatarOverlayWindowOptions(source) {
     "appearance:`avatarOverlay`,focusable:!1",
     windowOptionsPatch,
   );
+}
+
+function applyLinuxQueryCacheInvalidationBroadcastPatch(currentSource) {
+  const marker = "process.platform===`linux`&&this.windowManager.sendMessageToAllRegisteredWindows({type:`ipc-broadcast`,method:`query-cache-invalidate`";
+  if (currentSource.includes(marker)) {
+    return currentSource;
+  }
+
+  const original =
+    "case`query-cache-invalidate`:{t.queryKey[0]===`plugins`&&Sr(this.getAppServerConnection(this.hostId));let n=this.getIpcClientForWebContents(e);n&&await n.sendBroadcast(`query-cache-invalidate`,{queryKey:t.queryKey});break}";
+  if (!currentSource.includes(original)) {
+    console.warn(
+      "WARN: Could not find query cache invalidation handler - skipping Linux avatar settings sync patch",
+    );
+    return currentSource;
+  }
+
+  const versionMatch = currentSource.match(
+    /version:([A-Za-z_$][\w$]*)\.fc\(`query-cache-invalidate`\)/,
+  );
+  if (versionMatch == null) {
+    console.warn(
+      "WARN: Could not find query cache invalidation protocol version - skipping Linux avatar settings sync patch",
+    );
+    return currentSource;
+  }
+
+  const protocol = versionMatch[1];
+  const replacement =
+    "case`query-cache-invalidate`:{t.queryKey[0]===`plugins`&&Sr(this.getAppServerConnection(this.hostId));let r=this.getIpcClientForWebContents(e);r&&await r.sendBroadcast(`query-cache-invalidate`,{queryKey:t.queryKey});process.platform===`linux`&&this.windowManager.sendMessageToAllRegisteredWindows({type:`ipc-broadcast`,method:`query-cache-invalidate`,sourceClientId:`desktop`,version:" +
+    protocol +
+    ".fc(`query-cache-invalidate`),params:{queryKey:t.queryKey}});break}";
+  recordStrategy("avatar-settings-sync", "upstream");
+  return currentSource.replace(original, replacement);
 }
 
 function applyLinuxAvatarOverlayMousePassthroughPatch(currentSource) {
@@ -390,4 +424,5 @@ function applyLinuxAvatarOverlayMousePassthroughPatch(currentSource) {
 
 module.exports = {
   applyLinuxAvatarOverlayMousePassthroughPatch,
+  applyLinuxQueryCacheInvalidationBroadcastPatch,
 };
